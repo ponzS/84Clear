@@ -8,7 +8,7 @@ fi
 python3 -c 'import sys; assert sys.version_info >= (3,10), "需要 Python 3.10+"'
 mkdir -p "$install_dir"
 if [[ "$source_dir" != "$install_dir" ]]; then
-  cp "$source_dir/app.py" "$source_dir/core.py" "$source_dir/requirements.txt" "$source_dir/app.ico" "$install_dir/"
+  cp "$source_dir/app.py" "$source_dir/core.py" "$source_dir/naming.py" "$source_dir/requirements.txt" "$source_dir/app.ico" "$install_dir/"
 fi
 python3 -m venv "$install_dir/venv"
 "$install_dir/venv/bin/python" -m pip install -r "$install_dir/requirements.txt"

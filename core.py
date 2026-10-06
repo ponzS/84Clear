@@ -1,6 +1,7 @@
 from __future__ import annotations
 import configparser, ctypes, dataclasses, datetime, json, logging, logging.handlers, os, platform, re, shlex, shutil, stat, subprocess, sys, time
 from pathlib import Path
+from naming import SourceIndex, apply_label, alias, executable, file_names, manifest_names, package_alias, searchable, choose_name
 
 WINDOWS = sys.platform == 'win32'
 HOME = Path.home()
@@ -101,7 +102,7 @@ def check_data_path(path):
 def norm(value): return re.sub(r'[^\w]','',value.casefold(),flags=re.UNICODE)
 
 def related_data(app):
-    names = {norm(app.name),norm(app.meta.get('package','')),norm(app.meta.get('desktop_id',''))}
+    names = {norm(app.name),norm(app.meta.get('original_name','')),norm(app.meta.get('package','')),norm(app.meta.get('desktop_id',''))}
     location = app.meta.get('install','')
     if location: names.add(norm(Path(location).name))
     names -= {'','app','apps','application','applications','program','programs','bin','lib','data','desktop','client','software','update','updater','microsoft','windows','python','pcsteward'}
@@ -131,7 +132,7 @@ def related_data(app):
             'obsstudio':[roaming/'obs-studio'], 'vlcmediaplayer':[roaming/'vlc'],
             'notepad':[roaming/'Notepad++'], 'spotify':[roaming/'Spotify',local/'Spotify'],
         }
-        appname=re.sub(r'\s*\([^)]*\)\s*$','',app.name)
+        appname=re.sub(r'\s*\([^)]*\)\s*$','',app.meta.get('original_name',app.name))
         for p in recipes.get(norm(appname),[]):
             try:
                 if p.is_dir(): result.append(str(check_data_path(p)))
@@ -139,7 +140,9 @@ def related_data(app):
     return sorted(set(result))
 
 class Backend:
-    def startup(self): return windows_startup() if WINDOWS else linux_startup()
+    def startup(self):
+        modules=windows_startup() if WINDOWS else linux_startup()
+        return group_startup(modules,self.apps())
     def apps(self): return windows_apps() if WINDOWS else linux_apps()
     def caches(self):
         entries = []
@@ -233,7 +236,7 @@ def windows_startup():
     import winreg as w
     result=[]
     for hive,label in [(w.HKEY_CURRENT_USER,'当前用户'),(w.HKEY_LOCAL_MACHINE,'所有用户')]:
-        for view in [w.KEY_WOW64_64KEY,w.KEY_WOW64_32KEY]:
+        for view in ([w.KEY_WOW64_64KEY] if hive==w.HKEY_CURRENT_USER else [w.KEY_WOW64_64KEY,w.KEY_WOW64_32KEY]):
             for suffix,disabled in [('Run',False),('PCStewardDisabledRun',True)]:
                 keypath='Software\\Microsoft\\Windows\\CurrentVersion\\'+suffix
                 try:
@@ -257,11 +260,14 @@ def windows_startup():
                 if p.name.casefold()=='desktop.ini': continue
                 result.append(Entry('file:'+str(p),p.stem,'启动文件夹 · '+('所有用户' if machine else '当前用户'),str(p),enabled=enabled,meta={'type':'file','path':str(p),'base':str(base),'machine':machine}))
     try:
-        tasks=ps_json("Get-ScheduledTask | Where-Object { $_.Triggers.CimClass.CimClassName -match 'LogonTrigger|BootTrigger' } | Select-Object TaskName,TaskPath,@{n='State';e={[string]$_.State}},@{n='Command';e={($_.Actions.Execute -join '; ')}}")
+        tasks=ps_json("Get-ScheduledTask | Where-Object { $_.Triggers.Count -gt 0 } | Select-Object TaskName,TaskPath,@{n='State';e={[string]$_.State}},@{n='Command';e={($_.Actions.Execute -join '; ')}},@{n='Trigger';e={($_.Triggers.CimClass.CimClassName -join ',')}}")
         for task in tasks:
             protected=task['TaskPath'].startswith('\\Microsoft\\')
-            result.append(Entry('task:'+task['TaskPath']+task['TaskName'],task['TaskName'],'计划任务'+(' · 系统' if protected else ''),task.get('Command',''),enabled=task['State']!='Disabled',removable=not protected,meta={'type':'task','name':task['TaskName'],'path':task['TaskPath'],'machine':True}))
+            result.append(Entry('task:'+task['TaskPath']+task['TaskName'],task['TaskName'],('计划任务（登录/开机）' if re.search('LogonTrigger|BootTrigger',task.get('Trigger','')) else '计划任务（定时/事件）')+(' · 系统' if protected else ''),task.get('Command',''),enabled=task['State']!='Disabled',removable=not protected,meta={'type':'task','name':task['TaskName'],'path':task['TaskPath'],'machine':True}))
     except Exception as ex: logger.warning('计划任务读取失败 %s',ex)
+    for e in result:
+        path=executable(e.meta.get('command') or e.detail)
+        if path and Path(path).is_absolute() and Path(path).is_relative_to(Path(os.environ.get('SystemRoot','C:\\Windows'))): e.removable=False
     return sorted({e.id:e for e in result}.values(),key=lambda x:x.name.casefold())
 
 def windows_toggle(item,enabled):
@@ -297,7 +303,7 @@ def windows_apps():
     import winreg as w
     result=[]
     for hive,label in [(w.HKEY_CURRENT_USER,'当前用户'),(w.HKEY_LOCAL_MACHINE,'所有用户')]:
-        for view in [w.KEY_WOW64_64KEY,w.KEY_WOW64_32KEY]:
+        for view in ([w.KEY_WOW64_64KEY] if hive==w.HKEY_CURRENT_USER else [w.KEY_WOW64_64KEY,w.KEY_WOW64_32KEY]):
             keypath='Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
             try:
                 with w.OpenKey(hive,keypath,0,w.KEY_READ|view) as root:
@@ -310,14 +316,39 @@ def windows_apps():
                                 uninstall=reg_value(k,'UninstallString')
                                 protected=bool(reg_value(k,'SystemComponent',0) or reg_value(k,'NoRemove',0)) or name.casefold() in CORE_WINDOWS
                                 result.append(Entry(f'regapp:{label}:{view}:{sub}',name,'桌面应用 · '+label,reg_value(k,'InstallLocation'),version=str(reg_value(k,'DisplayVersion')),publisher=str(reg_value(k,'Publisher')),size=int(reg_value(k,'EstimatedSize',0))*1024,removable=bool(uninstall) and not protected,
-                                    meta={'uninstall':uninstall,'msi':bool(reg_value(k,'WindowsInstaller',0)),'package':sub,'install':reg_value(k,'InstallLocation') or inferred_install(uninstall),'protected':protected,'install_inferred':not bool(reg_value(k,'InstallLocation'))}))
+                                    meta={'display_icon':reg_value(k,'DisplayIcon'),'uninstall':uninstall,'msi':bool(reg_value(k,'WindowsInstaller',0)),'package':sub,'install':reg_value(k,'InstallLocation') or inferred_install(uninstall),'protected':protected,'install_inferred':not bool(reg_value(k,'InstallLocation'))}))
                         except OSError: pass
             except OSError: pass
+    menu=windows_menu()
     try:
-        for a in ps_json("$labels=@{}; Get-StartApps | ForEach-Object { $family=($_.AppID -split '!')[0]; if(-not $labels.ContainsKey($family)){$labels[$family]=$_.Name} }; Get-AppxPackage | Select-Object Name,PackageFullName,Version,Publisher,InstallLocation,NonRemovable,IsFramework,@{n='DisplayName';e={if($labels.ContainsKey($_.PackageFamilyName)){$labels[$_.PackageFamilyName]}else{$_.Name}}}"):
-            result.append(Entry('appx:'+a['PackageFullName'],a.get('DisplayName') or a['Name'],'Microsoft Store',a.get('InstallLocation',''),version=str(a['Version']),publisher=a.get('Publisher',''),removable=not a.get('NonRemovable',False) and not a.get('IsFramework',False),meta={'package':a['PackageFullName'],'appx':True,'install':a.get('InstallLocation','')}))
+        for a in ps_json("Get-AppxPackage | Select-Object Name,PackageFullName,PackageFamilyName,Version,Publisher,InstallLocation,NonRemovable,IsFramework"):
+            item=Entry('appx:'+a['PackageFullName'],a['Name'],'Microsoft Store',a.get('InstallLocation',''),version=str(a['Version']),publisher=a.get('Publisher',''),removable=not a.get('NonRemovable',False) and not a.get('IsFramework',False),meta={'package':a['PackageFullName'],'appx':True,'install':a.get('InstallLocation','')})
+            family=a.get('PackageFamilyName','')
+            candidates=[(r['Name'],'开始菜单') for r in menu if family and r.get('AppID','').startswith(family+'!')]
+            candidates += [(v,'商店清单资源') for v in manifest_names(a.get('InstallLocation',''),a['Name'],a['PackageFullName'])]
+            known=package_alias(a['Name'],a.get('InstallLocation',''))
+            if known: candidates.append((known,'Windows 组件说明'))
+            apply_label(item,candidates,'商店组件'); result.append(item)
     except Exception as ex: logger.warning('Store 应用读取失败 %s',ex)
+    index=SourceIndex(result,menu)
+    for item in result:
+        if item.meta.get('appx'): continue
+        root=item.meta.get('install','')
+        candidates=[(item.name,'系统应用登记')]+index.menu_names(root,root=True)
+        icon=item.meta.get('display_icon','').strip('"').split(',')[0]
+        if icon: candidates+=file_names(icon)
+        apply_label(item,candidates)
     return sorted(result,key=lambda a:a.name.casefold())
+
+_MENU_CACHE=(0,[])
+def windows_menu():
+    global _MENU_CACHE
+    if time.monotonic()-_MENU_CACHE[0]<180: return _MENU_CACHE[1]
+    try:
+        rows=ps_json(r"""$rows=@(); Get-StartApps | ForEach-Object { $rows+=@{Name=$_.Name;AppID=$_.AppID;Target=''} }; $shell=New-Object -ComObject WScript.Shell; foreach($base in @([Environment]::GetFolderPath('Programs'),[Environment]::GetFolderPath('CommonPrograms'))){ Get-ChildItem -LiteralPath $base -Filter *.lnk -Recurse -ErrorAction SilentlyContinue | ForEach-Object { try{$shortcut=$shell.CreateShortcut($_.FullName);$rows+=@{Name=$_.BaseName;AppID='';Target=$shortcut.TargetPath}}catch{} } }; @($rows)""")
+        _MENU_CACHE=(time.monotonic(),rows)
+        return rows
+    except Exception as ex: logger.warning('开始菜单读取失败 %s',ex); return []
 
 def windows_uninstall(app):
     if not app.removable: raise ValueError('该应用属于受保护组件或没有登记卸载器。')
@@ -405,6 +436,7 @@ def linux_apps():
         for line in run(['snap','list'],check=False).splitlines()[1:]:
             c=line.split()
             if len(c)>=6: result.append(Entry('snap:'+c[0],c[0],'Snap',version=c[1],publisher=c[4],removable=c[0] not in ('snapd','core','core18','core20','core22','core24','bare'),meta={'package':c[0]}))
+    linux_labels(result)
     return sorted(result,key=lambda a:a.name.casefold())
 
 def linux_uninstall_command(app,purge=False):
@@ -478,13 +510,7 @@ def inferred_install(command):
 def processes(apps=None):
     import psutil
     apps=apps or []
-    candidates=[]
-    for app in apps:
-        location=app.meta.get('install','')
-        if location:
-            p=Path(location)
-            if p.is_absolute(): candidates.append((str(p).casefold().rstrip('\\/'),app))
-    candidates.sort(key=lambda pair:len(pair[0]),reverse=True)
+    index=SourceIndex(apps,windows_menu() if WINDOWS else [])
     samples=[]
     for p in psutil.process_iter(['pid','name','exe','username','create_time','memory_info','cmdline']):
         try:
@@ -495,26 +521,30 @@ def processes(apps=None):
     for p,info in samples:
         try: cpu=p.cpu_percent(None)/cores
         except (psutil.NoSuchProcess,psutil.AccessDenied): continue
-        exe=info.get('exe') or ''; directory=str(Path(exe).parent) if exe else ''
-        owner=None; base=directory
-        for root,app in candidates:
-            if exe and (exe.casefold().startswith(root+os.sep) or directory.casefold()==root): owner=app; base=app.meta['install']; break
+        exe=info.get('exe') or ''
+        if exe and not Path(exe).is_absolute(): exe=''
+        directory=str(Path(exe).parent) if exe else ''
+        owner=index.owner(exe); product=index.product_root(exe); base=(owner.meta.get('install') or directory) if owner else product[0] if product else directory
         if not WINDOWS and directory in ('/usr/bin','/usr/local/bin','/bin','/sbin','/usr/sbin'):
             base=exe
         key=base.casefold() if base else 'unknown:'+str(info['pid'])
         if key not in groups:
-            name=owner.name if owner else Path(base).name if base else info.get('name') or '未知进程'
+            name,name_source=index.label(exe,info.get('name') or '',owner)
+            if product and not owner: name=product[1]; name_source='产品来源目录'
             system=WINDOWS and directory.casefold().startswith(os.environ.get('SystemRoot','C:\\Windows').casefold()+os.sep)
-            if system: name='Windows 系统 · '+Path(directory).name
-            groups[key]=Entry('process:'+key,name,'已匹配应用' if owner else '系统目录' if system else '可执行文件目录' if directory else '来源不可读',base or '无法读取可执行文件路径',meta={'path':base,'processes':[],'cpu':0,'count':0})
+            if system and directory.casefold() in {str(Path(os.environ.get('SystemRoot','C:\\Windows'))/'System32').casefold(),str(Path(os.environ.get('SystemRoot','C:\\Windows'))/'SysWOW64').casefold()}: name='Windows 系统服务'
+            elif system and not owner: name='Windows 系统 · '+name
+            groups[key]=Entry('process:'+key,name,'已匹配应用' if owner else '系统目录' if system else '可执行文件目录' if directory else '来源不可读',base or '无法读取可执行文件路径',meta={'path':base,'processes':[],'cpu':0,'count':0,'original_name':Path(base).name if base else info.get('name',''),'name_source':name_source})
         e=groups[key]; mem=info.get('memory_info'); rss=mem.rss if mem else 0
-        detail={'pid':info['pid'],'name':info.get('name') or '', 'exe':exe,'created':info.get('create_time',0),'cpu':round(cpu,2),'memory':rss,'user':info.get('username') or '', 'command':subprocess.list2cmdline(info.get('cmdline') or []) if WINDOWS else shlex.join(info.get('cmdline') or []),'protected':protected_process(info)}
+        friendly,origin=index.label(exe,info.get('name') or '',None)
+        if owner and friendly in ('chrome.exe','crashpad_handler.exe','promecefpluginhost.exe'): friendly=owner.name+' · 辅助进程'
+        detail={'pid':info['pid'],'name':friendly,'original_name':info.get('name') or '', 'name_source':origin, 'exe':exe,'created':info.get('create_time',0),'cpu':round(cpu,2),'memory':rss,'user':info.get('username') or '', 'command':subprocess.list2cmdline(info.get('cmdline') or []) if WINDOWS else shlex.join(info.get('cmdline') or []),'protected':protected_process(info)}
         e.meta['processes'].append(detail); e.meta['cpu']+=cpu; e.meta['count']+=1; e.size+=rss
     return sorted(groups.values(),key=lambda e:e.size,reverse=True)
 
 def protected_process(info):
     name=(info.get('name') or '').casefold(); exe=info.get('exe') or ''
-    if info['pid'] in (0,1,4,os.getpid()) or not exe: return True
+    if info['pid'] in (0,1,4,os.getpid()) or not exe or not Path(exe).is_absolute(): return True
     if name in {'sshd','sshd.exe','ssh','ssh.exe','system','registry','csrss.exe','wininit.exe','winlogon.exe','lsass.exe','services.exe','smss.exe','svchost.exe','systemd','init','dbus-daemon','polkitd','pcsteward.exe'}: return True
     if WINDOWS:
         root=os.environ.get('SystemRoot','C:\\Windows').casefold().rstrip('\\')
@@ -537,3 +567,87 @@ def terminate_processes(items):
         except psutil.NoSuchProcess: successes.append(item['pid'])
         except Exception as ex: failures.append(f"PID {item['pid']}：{ex}")
     return f'已结束 {len(successes)} 个进程。'+('\n'+'\n'.join(failures) if failures else '')
+
+
+def linux_labels(apps):
+    roots=[Path(os.environ.get('XDG_DATA_HOME',str(HOME/'.local/share')))/'applications',Path('/usr/share/applications'),Path('/usr/local/share/applications'),HOME/'.local/share/flatpak/exports/share/applications',Path('/var/lib/flatpak/exports/share/applications')]
+    entries=[]; owners={}
+    for root in roots:
+        if not root.is_dir(): continue
+        for p in root.glob('*.desktop'):
+            try:
+                d=desktop_config(p)['Desktop Entry']
+                if d.get('Type','Application')!='Application': continue
+                label=d.get('Name[zh_CN]') or d.get('Name[zh]') or d.get('Name','')
+                exe=executable(d.get('Exec',''),False)
+                if exe and not Path(exe).is_absolute(): exe=shutil.which(exe) or exe
+                entries.append((p,label,exe))
+            except (OSError,KeyError,configparser.Error): pass
+    if shutil.which('dpkg-query'):
+        out=run(['dpkg-query','-S','/usr/share/applications/*.desktop'],check=False)
+        for line in out.splitlines():
+            if ': /' in line:
+                owner,path=line.rsplit(': ',1); owners[path]=owner.split(':')[0]
+    elif shutil.which('pacman') and entries:
+        out=run(['pacman','-Qo',*[str(p) for p,_,_ in entries]],check=False)
+        for line in out.splitlines():
+            match=re.match(r'(.+) is owned by (\S+) ',line)
+            if match: owners[match[1]]=match[2]
+    for app in apps:
+        package=app.meta.get('package','').split(':')[0]
+        relevant=[(p,label,exe) for p,label,exe in entries if p.stem==package or owners.get(str(p))==package]
+        candidates=[(label,'桌面应用中文名') for p,label,exe in relevant]
+        apply_label(app,candidates)
+        app.meta['executables']=[exe for p,label,exe in relevant if exe]
+        if relevant: app.meta['desktop_id']=relevant[0][0].stem
+
+def startup_command(item):
+    if item.meta.get('type')=='file' and WINDOWS:
+        try: return ps('$s=(New-Object -ComObject WScript.Shell).CreateShortcut('+ps_quote(item.meta['path'])+');$s.TargetPath')
+        except Exception: return ''
+    if item.meta.get('type')=='unit':
+        # Read ExecStart without changing the service.
+        text=run(['systemctl','--user','show',item.meta['unit'],'--property=ExecStart','--value'],check=False)
+        found=re.search(r'path=([^ ;]+)',text)
+        return found[1] if found else ''
+    return item.meta.get('command') or item.detail
+
+def group_startup(modules,apps):
+    index=SourceIndex(apps,windows_menu() if WINDOWS else [])
+    groups={}
+    for item in modules:
+        command=startup_command(item); exe=executable(command)
+        if not WINDOWS and exe and not Path(exe).is_absolute(): exe=shutil.which(exe) or exe
+        owner=index.owner(exe); product=index.product_root(exe)
+        name,origin=index.label(exe,item.name,owner)
+        # Module roles remain visible in the detail dialog, even when the product is shared.
+        item.meta['original_name']=item.name; item.meta['display_name']=name; item.meta['name_source']=origin; item.meta['executable']=exe
+        if WINDOWS and item.meta.get('type')=='task' and not item.removable and item.meta.get('path','').startswith('\\Microsoft\\'):
+            key='windows:system-tasks'; group_name='Windows 系统计划任务'; location=os.environ.get('SystemRoot','C:\\Windows')
+        elif owner:
+            key='app:'+owner.id; group_name=owner.name; location=owner.meta.get('install') or str(Path(exe).parent)
+        elif product:
+            location,group_name=product; key='product:'+location.casefold()
+        elif exe and Path(exe).is_absolute():
+            parent=str(Path(exe).parent)
+            generic=parent.casefold() in {str(Path(os.environ.get('SystemRoot','C:\\Windows'))/'System32').casefold(),'/usr/bin','/bin','/usr/local/bin'}
+            key='exe:'+exe.casefold() if generic else 'path:'+parent.casefold()
+            group_name=name; location=exe if generic else parent
+        else:
+            key='unknown:'+item.id; group_name=name; location=item.detail
+        if key not in groups:
+            groups[key]=Entry('startupgroup:'+key,group_name,'',location,enabled=False,removable=False,meta={'modules':[],'path':location,'original_name':owner.meta.get('original_name',owner.name) if owner else item.name,'name_source':origin})
+        group=groups[key]; group.meta['modules'].append(item); group.enabled|=item.enabled; group.removable|=item.removable
+    for group in groups.values():
+        group.source=' / '.join(sorted({m.source.split(' · ')[0] for m in group.meta['modules']}))
+        group.meta['count']=len(group.meta['modules']); group.meta['enabled_count']=sum(m.enabled for m in group.meta['modules'])
+    return sorted(groups.values(),key=lambda e:e.name.casefold())
+
+
+def batch_uninstall(backend,apps,paths,purge=False):
+    report=[]
+    for i,app in enumerate(apps):
+        try: report.append(app.name+'：'+backend.uninstall(app,paths.get(app.id,[]),purge and app.source in ('DEB','Snap')))
+        except Exception as ex:
+            report.append(app.name+'：'+str(ex)); report.append(f'批量卸载已停止，其余 {len(apps)-i-1} 个应用未操作。'); break
+    return '\n\n'.join(report)

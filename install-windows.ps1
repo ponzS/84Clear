@@ -23,7 +23,7 @@ foreach ($path in @((Join-Path $desktop '电脑管家.lnk'), (Join-Path $startMe
 $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\PCSteward'
 New-Item $key -Force | Out-Null
 $values = @{
-    DisplayName = 'PC Steward 电脑管家'; DisplayVersion = '1.0.0'; Publisher = 'PC Steward'; InstallLocation = $installDir;
+    DisplayName = 'PC Steward 电脑管家'; DisplayVersion = '1.1.0'; Publisher = 'PC Steward'; InstallLocation = $installDir;
     DisplayIcon = "$exe,0"; UninstallString = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$installDir\uninstall-windows.ps1`""
 }
 foreach ($pair in $values.GetEnumerator()) { New-ItemProperty -Path $key -Name $pair.Key -Value $pair.Value -PropertyType String -Force | Out-Null }
